@@ -1,0 +1,625 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Recoverability band study (submission-ready, single-script, reproducible)
+
+Outputs (to ./output by default):
+- table_dt_1e-03.csv
+- table_dt_5e-04.csv
+- table_beta02.csv
+- table_beta_difference.csv
+- metrics_summary.csv
+- Figure2_phase_R_1e-03.png
+- Figure2_phase_R_5e-04.png
+- Figure_dt_difference_R.png
+- Figure3_band_robustness.png
+- Figure4_beta_comparison.png
+- Figure4_beta_difference.png
+- Figure_B_edges_and_Trec_1e-03.png
+- Figure_B_edges_and_Trec_5e-04.png
+
+Model:
+dx/dt = -gamma*x(t) + k*tanh(x(t-tau)) + beta*x(t)^3 + sigma*xi(t)
+
+Recoverability R:
+fraction of Monte-Carlo trials that enter |x|<eps and remain there for Twin continuously.
+
+Author: (you)
+"""
+
+from __future__ import annotations
+import argparse
+import csv
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+@dataclass(frozen=True)
+class Params:
+    k: float = 2.0
+    sigma: float = 0.02
+    A: float = 1.0
+    beta: float = 0.0
+
+
+@dataclass(frozen=True)
+class Grid:
+    tau_min: float = 0.0
+    tau_max: float = 0.5
+    n_tau: int = 21              # 0.0 ... 0.5 (step 0.025)
+    gamma_min: float = 0.2
+    gamma_max: float = 2.0
+    n_gamma: int = 19            # 0.2 ... 2.0 (step 0.1)
+
+
+@dataclass(frozen=True)
+class RecoveryDef:
+    eps: float = 0.10            # neighborhood |x|<eps
+    Twin: float = 1.0            # must stay inside for Twin
+    T: float = 20.0              # total simulated time
+
+
+def _simulate_one_trial(
+    rng: np.random.Generator,
+    gamma: float,
+    tau: float,
+    dt: float,
+    p: Params,
+    rec: RecoveryDef,
+) -> Tuple[bool, Optional[float]]:
+    """
+    Euler–Maruyama for delayed SDE with circular buffer.
+    Returns (recovered?, T_rec if recovered else None)
+    """
+
+    # time discretization
+    n_steps = int(np.round(rec.T / dt))
+    if n_steps < 10:
+        raise ValueError("T/dt too small.")
+
+    # delay steps (integer) and buffer length
+    delay_steps = int(np.round(tau / dt))
+    buf_len = max(delay_steps + 2, 8)
+
+    # init buffer with x=0 history (standard minimal DDE convention)
+    buf = np.zeros(buf_len, dtype=float)
+    idx = 0
+
+    # finite perturbation at t=0
+    x = rng.uniform(-p.A, p.A)
+    buf[idx] = x
+
+    # recovery window counter
+    win_steps = int(np.ceil(rec.Twin / dt))
+    inside_count = 0
+    t_rec: Optional[float] = None
+
+    # noise scale
+    noise_scale = p.sigma * np.sqrt(dt)
+
+    for step in range(1, n_steps + 1):
+        # delayed state
+        if delay_steps == 0:
+            x_tau = x
+        else:
+            j = (idx - delay_steps) % buf_len
+            x_tau = buf[j]
+
+        drift = (-gamma * x) + (p.k * np.tanh(x_tau)) + (p.beta * (x ** 3))
+        x = x + dt * drift + noise_scale * rng.normal()
+
+        idx = (idx + 1) % buf_len
+        buf[idx] = x
+
+        # check recovery criterion
+        if abs(x) < rec.eps:
+            inside_count += 1
+            if inside_count >= win_steps and t_rec is None:
+                # onset of sustained residence: backdate to first step of the run
+                t_rec = (step - win_steps + 1) * dt
+        else:
+            inside_count = 0
+
+    return (t_rec is not None), t_rec
+
+
+def estimate_R_and_Trec(
+    seed: int,
+    n_trials: int,
+    dt: float,
+    grid: Grid,
+    p: Params,
+    rec: RecoveryDef,
+) -> Dict[str, np.ndarray]:
+    """
+    Returns:
+    - tau_vals (n_tau,)
+    - gamma_vals (n_gamma,)
+    - R (n_gamma, n_tau)
+    - n_rec (n_gamma, n_tau)
+    - Trec_median (n_gamma, n_tau)   median over recovered trials, NaN if none
+    """
+    rng = np.random.default_rng(seed)
+
+    tau_vals = np.linspace(grid.tau_min, grid.tau_max, grid.n_tau)
+    gamma_vals = np.linspace(grid.gamma_min, grid.gamma_max, grid.n_gamma)
+
+    R = np.zeros((grid.n_gamma, grid.n_tau), dtype=float)
+    n_rec = np.zeros((grid.n_gamma, grid.n_tau), dtype=int)
+    Trec_median = np.full((grid.n_gamma, grid.n_tau), np.nan, dtype=float)
+
+    for ig, gamma in enumerate(gamma_vals):
+        for it, tau in enumerate(tau_vals):
+            trecs: List[float] = []
+            recovered = 0
+
+            # reproducible per-point stream (stable even if loop order changes)
+            # (seed scrambling avoids accidental correlation)
+            point_seed = (seed * 1_000_003 + ig * 10_007 + it * 97_531) & 0xFFFFFFFF
+            prng = np.random.default_rng(point_seed)
+
+            for _ in range(n_trials):
+                ok, t_rec = _simulate_one_trial(prng, float(gamma), float(tau), float(dt), p, rec)
+                if ok:
+                    recovered += 1
+                    trecs.append(float(t_rec))  # type: ignore[arg-type]
+
+            n_rec[ig, it] = recovered
+            R[ig, it] = recovered / float(n_trials)
+            if recovered > 0:
+                Trec_median[ig, it] = float(np.median(np.array(trecs, dtype=float)))
+
+    return {
+        "tau_vals": tau_vals,
+        "gamma_vals": gamma_vals,
+        "R": R,
+        "n_rec": n_rec,
+        "Trec_median": Trec_median,
+    }
+
+
+def save_table_csv(
+    path: Path,
+    tau_vals: np.ndarray,
+    gamma_vals: np.ndarray,
+    R: np.ndarray,
+    n_rec: np.ndarray,
+    Trec_median: np.ndarray,
+) -> None:
+    """
+    Writes long-format table:
+    tau,gamma,R,n_rec,Trec_median
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["tau", "gamma", "R", "n_rec", "Trec_median"])
+        for ig, g in enumerate(gamma_vals):
+            for it, t in enumerate(tau_vals):
+                w.writerow([
+                    f"{t:.6g}",
+                    f"{g:.6g}",
+                    f"{R[ig, it]:.6g}",
+                    int(n_rec[ig, it]),
+                    "" if np.isnan(Trec_median[ig, it]) else f"{Trec_median[ig, it]:.6g}",
+                ])
+
+
+def plot_phase(
+    outpath: Path,
+    tau_vals: np.ndarray,
+    gamma_vals: np.ndarray,
+    R: np.ndarray,
+    title: str,
+    contour_level: float = 0.05,
+) -> None:
+    outpath.parent.mkdir(parents=True, exist_ok=True)
+    fig = plt.figure(figsize=(6.8, 4.8))
+    ax = plt.gca()
+
+    # imshow expects [rows(y)=gamma, cols(x)=tau]
+    im = ax.imshow(
+        R,
+        origin="lower",
+        aspect="auto",
+        extent=[tau_vals.min(), tau_vals.max(), gamma_vals.min(), gamma_vals.max()],
+    )
+    cb = plt.colorbar(im, ax=ax)
+    cb.set_label("Recoverability R")
+
+    # contour at R=0.05 (matches the white contours in your screenshots)
+    try:
+        TT, GG = np.meshgrid(tau_vals, gamma_vals)
+        ax.contour(TT, GG, R, levels=[contour_level], colors="white", linewidths=1.2)
+    except Exception:
+        pass
+
+    ax.set_xlabel("tau (delay)")
+    ax.set_ylabel("gamma (dissipation)")
+    ax.set_title(title)
+
+    plt.tight_layout()
+    fig.savefig(outpath, dpi=200)
+    plt.close(fig)
+
+
+def plot_dt_difference(
+    outpath: Path,
+    tau_vals: np.ndarray,
+    gamma_vals: np.ndarray,
+    dR: np.ndarray,
+    title: str,
+) -> None:
+    outpath.parent.mkdir(parents=True, exist_ok=True)
+    fig = plt.figure(figsize=(6.8, 4.8))
+    ax = plt.gca()
+    im = ax.imshow(
+        dR,
+        origin="lower",
+        aspect="auto",
+        extent=[tau_vals.min(), tau_vals.max(), gamma_vals.min(), gamma_vals.max()],
+    )
+    cb = plt.colorbar(im, ax=ax)
+    cb.set_label("Delta Recoverability (dt fine - dt coarse)")
+
+    ax.set_xlabel("tau (delay)")
+    ax.set_ylabel("gamma (dissipation)")
+    ax.set_title(title)
+
+    plt.tight_layout()
+    fig.savefig(outpath, dpi=200)
+    plt.close(fig)
+
+
+def plot_threshold_robustness(
+    outpath: Path,
+    tau_vals: np.ndarray,
+    gamma_vals: np.ndarray,
+    R_coarse: np.ndarray,
+    R_fine: np.ndarray,
+    thresholds: Tuple[float, float, float] = (0.03, 0.05, 0.10),
+) -> None:
+    outpath.parent.mkdir(parents=True, exist_ok=True)
+
+    fig = plt.figure(figsize=(10.5, 6.2))
+    fig.suptitle("Robustness: dt x threshold")
+
+    # 2 rows (dt coarse/fine) x 3 cols thresholds
+    for r, R in enumerate([R_coarse, R_fine]):
+        for c, thr in enumerate(thresholds):
+            ax = plt.subplot(2, 3, r * 3 + c + 1)
+            mask = (R > thr).astype(float)
+            ax.imshow(
+                1.0 - mask,  # show recovered-region as white (like your screenshots)
+                origin="lower",
+                aspect="auto",
+                extent=[tau_vals.min(), tau_vals.max(), gamma_vals.min(), gamma_vals.max()],
+                vmin=0,
+                vmax=1,
+            )
+            if r == 0:
+                ax.set_title(f"R > {thr:g}")
+            if c == 0:
+                ax.set_ylabel("dt=1e-03" if r == 0 else "dt=5e-04")
+            ax.set_xlabel("tau (delay)")
+            ax.set_yticks([])
+
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    fig.savefig(outpath, dpi=200)
+    plt.close(fig)
+
+
+def compute_band_edges_and_trec(
+    tau_vals: np.ndarray,
+    gamma_vals: np.ndarray,
+    R: np.ndarray,
+    Trec_median: np.ndarray,
+    threshold: float = 0.05,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    For each tau, find gamma_min and gamma_max where R>=threshold.
+    Returns arrays (gamma_min, gamma_max, Trec_at_gamma_min, Trec_at_gamma_max), each (n_tau,)
+    If no gamma satisfies the threshold at a given tau, returns NaN for that tau.
+    """
+    n_tau = tau_vals.size
+    gmin = np.full(n_tau, np.nan)
+    gmax = np.full(n_tau, np.nan)
+    trec_min = np.full(n_tau, np.nan)
+    trec_max = np.full(n_tau, np.nan)
+
+    for it in range(n_tau):
+        col = R[:, it]
+        idxs = np.where(col >= threshold)[0]
+        if idxs.size == 0:
+            continue
+        i0 = int(idxs.min())
+        i1 = int(idxs.max())
+        gmin[it] = gamma_vals[i0]
+        gmax[it] = gamma_vals[i1]
+        trec_min[it] = Trec_median[i0, it]
+        trec_max[it] = Trec_median[i1, it]
+
+    return gmin, gmax, trec_min, trec_max
+
+
+def plot_edges_and_trec(
+    outpath: Path,
+    tau_vals: np.ndarray,
+    gmin: np.ndarray,
+    gmax: np.ndarray,
+    trec_min: np.ndarray,
+    trec_max: np.ndarray,
+    title_suffix: str,
+) -> None:
+    outpath.parent.mkdir(parents=True, exist_ok=True)
+
+    fig = plt.figure(figsize=(8.8, 5.6))
+
+    ax1 = plt.subplot(2, 1, 1)
+    ax1.plot(tau_vals, gmin, marker="o", linewidth=1.2, label="gamma_min (band edge)")
+    ax1.plot(tau_vals, gmax, marker="s", linewidth=1.2, linestyle="--", label="gamma_max (band edge)")
+    ax1.set_xlabel("tau (delay)")
+    ax1.set_ylabel("gamma")
+    ax1.set_title(f"Band edges vs tau {title_suffix}")
+    ax1.grid(True, alpha=0.3)
+    ax1.legend()
+
+    ax2 = plt.subplot(2, 1, 2)
+    ax2.plot(tau_vals, trec_min, marker="o", linewidth=1.2, label="median T_rec at gamma_min")
+    ax2.plot(tau_vals, trec_max, marker="s", linewidth=1.2, linestyle="--", label="median T_rec at gamma_max")
+    ax2.set_xlabel("tau (delay)")
+    ax2.set_ylabel("median T_rec")
+    ax2.set_title("Band-edge recovery time (median)")
+    ax2.grid(True, alpha=0.3)
+    ax2.legend()
+
+    plt.tight_layout()
+    fig.savefig(outpath, dpi=200)
+    plt.close(fig)
+
+
+def plot_beta_comparison(
+    outpath: Path,
+    outpath_diff: Path,
+    tau_vals: np.ndarray,
+    gamma_vals: np.ndarray,
+    R0: np.ndarray,
+    Rb: np.ndarray,
+    beta_value: float,
+) -> None:
+    outpath.parent.mkdir(parents=True, exist_ok=True)
+
+    # comparison panel (a)
+    fig = plt.figure(figsize=(10.0, 4.8))
+
+    ax1 = plt.subplot(1, 2, 1)
+    im1 = ax1.imshow(
+        R0, origin="lower", aspect="auto",
+        extent=[tau_vals.min(), tau_vals.max(), gamma_vals.min(), gamma_vals.max()],
+    )
+    plt.colorbar(im1, ax=ax1)
+    ax1.set_title(r"$\beta=0$")
+    ax1.set_xlabel(r"$\tau$")
+    ax1.set_ylabel(r"$\gamma$")
+    ax1.set_title("Effect of cubic nonlinearity on recoverability band\n" + r"$\beta=0$")
+
+    ax2 = plt.subplot(1, 2, 2)
+    im2 = ax2.imshow(
+        Rb, origin="lower", aspect="auto",
+        extent=[tau_vals.min(), tau_vals.max(), gamma_vals.min(), gamma_vals.max()],
+    )
+    plt.colorbar(im2, ax=ax2)
+    ax2.set_title(rf"$\beta={beta_value}$")
+    ax2.set_xlabel(r"$\tau$")
+    ax2.set_ylabel(r"$\gamma$")
+
+    plt.tight_layout()
+    fig.savefig(outpath, dpi=200)
+    plt.close(fig)
+
+    # difference panel (b)
+    dR = Rb - R0
+    fig2 = plt.figure(figsize=(6.8, 4.8))
+    ax = plt.gca()
+    im = ax.imshow(
+        dR, origin="lower", aspect="auto",
+        extent=[tau_vals.min(), tau_vals.max(), gamma_vals.min(), gamma_vals.max()],
+    )
+    cb = plt.colorbar(im, ax=ax)
+    cb.set_label("Delta Recoverability")
+    ax.set_title(rf"$\Delta R = R(\beta={beta_value}) - R(\beta=0)$")
+    ax.set_xlabel("tau (delay)")
+    ax.set_ylabel("gamma (dissipation)")
+    plt.tight_layout()
+    fig2.savefig(outpath_diff, dpi=200)
+    plt.close(fig2)
+
+
+def write_metrics_summary(
+    path: Path,
+    dt_coarse: float,
+    dt_fine: float,
+    R_coarse: np.ndarray,
+    R_fine: np.ndarray,
+    dR: np.ndarray,
+    beta_value: float,
+    dR_beta: np.ndarray,
+    thresholds: Tuple[float, float, float] = (0.03, 0.05, 0.10),
+) -> None:
+    """
+    Single-row CSV with the key summary numbers reviewers tend to ask for.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    abs_dR = np.abs(dR)
+    abs_dR_beta = np.abs(dR_beta)
+
+    def frac_above(R: np.ndarray, thr: float) -> float:
+        return float(np.mean(R > thr))
+
+    row = {
+        "dt_coarse": dt_coarse,
+        "dt_fine": dt_fine,
+        "R_coarse_min": float(np.min(R_coarse)),
+        "R_coarse_max": float(np.max(R_coarse)),
+        "R_fine_min": float(np.min(R_fine)),
+        "R_fine_max": float(np.max(R_fine)),
+        "abs_dR_median": float(np.median(abs_dR)),
+        "abs_dR_p95": float(np.quantile(abs_dR, 0.95)),
+        "abs_dR_max": float(np.max(abs_dR)),
+        "beta_value": beta_value,
+        "abs_dR_beta_median": float(np.median(abs_dR_beta)),
+        "abs_dR_beta_p95": float(np.quantile(abs_dR_beta, 0.95)),
+        "abs_dR_beta_max": float(np.max(abs_dR_beta)),
+    }
+    for thr in thresholds:
+        row[f"area_frac_Rcoarse_gt_{thr:g}"] = frac_above(R_coarse, thr)
+        row[f"area_frac_Rfine_gt_{thr:g}"] = frac_above(R_fine, thr)
+
+    with path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(list(row.keys()))
+        w.writerow([row[k] for k in row.keys()])
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--outdir", type=str, default="output")
+    ap.add_argument("--seed", type=int, default=12345)
+    ap.add_argument("--n_trials", type=int, default=200)
+    ap.add_argument("--dt_coarse", type=float, default=1e-3)
+    ap.add_argument("--dt_fine", type=float, default=5e-4)
+
+    # grid
+    ap.add_argument("--tau_min", type=float, default=0.0)
+    ap.add_argument("--tau_max", type=float, default=0.5)
+    ap.add_argument("--n_tau", type=int, default=21)
+    ap.add_argument("--gamma_min", type=float, default=0.2)
+    ap.add_argument("--gamma_max", type=float, default=2.0)
+    ap.add_argument("--n_gamma", type=int, default=19)
+
+    # recoverability definition
+    ap.add_argument("--eps", type=float, default=0.10)
+    ap.add_argument("--Twin", type=float, default=1.0)
+    ap.add_argument("--T", type=float, default=20.0)
+
+    # model parameters
+    ap.add_argument("--k", type=float, default=2.0)
+    ap.add_argument("--sigma", type=float, default=0.02)
+    ap.add_argument("--A", type=float, default=1.0)
+    ap.add_argument("--beta_test", type=float, default=0.2)
+
+    # band metrics
+    ap.add_argument("--edge_threshold", type=float, default=0.05)
+
+    args = ap.parse_args()
+
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    grid = Grid(
+        tau_min=args.tau_min, tau_max=args.tau_max, n_tau=args.n_tau,
+        gamma_min=args.gamma_min, gamma_max=args.gamma_max, n_gamma=args.n_gamma,
+    )
+    rec = RecoveryDef(eps=args.eps, Twin=args.Twin, T=args.T)
+
+    # base params (beta=0)
+    p0 = Params(k=args.k, sigma=args.sigma, A=args.A, beta=0.0)
+
+    # dt runs
+    coarse = estimate_R_and_Trec(args.seed, args.n_trials, args.dt_coarse, grid, p0, rec)
+    fine = estimate_R_and_Trec(args.seed, args.n_trials, args.dt_fine, grid, p0, rec)
+
+    tau_vals = coarse["tau_vals"]
+    gamma_vals = coarse["gamma_vals"]
+
+    R_coarse = coarse["R"]
+    R_fine = fine["R"]
+    dR = R_fine - R_coarse
+
+    # CSV tables (long format)
+    save_table_csv(outdir / "table_dt_1e-03.csv", tau_vals, gamma_vals,
+                   R_coarse, coarse["n_rec"], coarse["Trec_median"])
+    save_table_csv(outdir / "table_dt_5e-04.csv", tau_vals, gamma_vals,
+                   R_fine, fine["n_rec"], fine["Trec_median"])
+
+    # Figures: phase diagrams (keep your established filenames)
+    plot_phase(outdir / "Figure2_phase_R_1e-03.png",
+               tau_vals, gamma_vals, R_coarse, "Recoverability phase diagram (1e-03)")
+    plot_phase(outdir / "Figure2_phase_R_5e-04.png",
+               tau_vals, gamma_vals, R_fine, "Recoverability phase diagram (5e-04)")
+
+    # Figure: dt difference
+    plot_dt_difference(outdir / "Figure_dt_difference_R.png",
+                       tau_vals, gamma_vals, dR,
+                       r"$\Delta R = R(\Delta t=5\times10^{-4}) - R(\Delta t=1\times10^{-3})$")
+
+    # Figure: threshold robustness (2x3)
+    plot_threshold_robustness(outdir / "Figure3_band_robustness.png",
+                              tau_vals, gamma_vals, R_coarse, R_fine)
+
+    # Band edges + recovery time stats (threshold=0.05 by default)
+    thr = float(args.edge_threshold)
+
+    gmin_c, gmax_c, trecmin_c, trecmax_c = compute_band_edges_and_trec(
+        tau_vals, gamma_vals, R_coarse, coarse["Trec_median"], threshold=thr
+    )
+    gmin_f, gmax_f, trecmin_f, trecmax_f = compute_band_edges_and_trec(
+        tau_vals, gamma_vals, R_fine, fine["Trec_median"], threshold=thr
+    )
+
+    plot_edges_and_trec(outdir / "Figure_B_edges_and_Trec_1e-03.png",
+                        tau_vals, gmin_c, gmax_c, trecmin_c, trecmax_c,
+                        f"(dt=1e-03, threshold={thr:g})")
+
+    plot_edges_and_trec(outdir / "Figure_B_edges_and_Trec_5e-04.png",
+                        tau_vals, gmin_f, gmax_f, trecmin_f, trecmax_f,
+                        f"(dt=5e-04, threshold={thr:g})")
+
+    # beta test at dt_coarse (to match your current workflow)
+    pb = Params(k=args.k, sigma=args.sigma, A=args.A, beta=float(args.beta_test))
+    beta = estimate_R_and_Trec(args.seed, args.n_trials, args.dt_coarse, grid, pb, rec)
+
+    R_beta = beta["R"]
+    dR_beta = R_beta - R_coarse
+
+    save_table_csv(outdir / "table_beta02.csv", tau_vals, gamma_vals,
+                   R_beta, beta["n_rec"], beta["Trec_median"])
+
+    # also export the beta difference as a long table (tau,gamma,Delta_R)
+    with (outdir / "table_beta_difference.csv").open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["tau", "gamma", "Delta_R_beta02_minus_beta0"])
+        for ig, g in enumerate(gamma_vals):
+            for it, t in enumerate(tau_vals):
+                w.writerow([f"{t:.6g}", f"{g:.6g}", f"{dR_beta[ig, it]:.6g}"])
+
+    plot_beta_comparison(
+        outdir / "Figure4_beta_comparison.png",
+        outdir / "Figure4_beta_difference.png",
+        tau_vals, gamma_vals, R_coarse, R_beta, float(args.beta_test),
+    )
+
+    # metrics summary
+    write_metrics_summary(
+        outdir / "metrics_summary.csv",
+        float(args.dt_coarse),
+        float(args.dt_fine),
+        R_coarse, R_fine, dR,
+        float(args.beta_test),
+        dR_beta,
+    )
+
+    print("done")
+    print(f"output dir: {outdir.resolve()}")
+    print("files:")
+    for pth in sorted(outdir.glob("*")):
+        print(" -", pth.name)
+
+
+if __name__ == "__main__":
+    main()
